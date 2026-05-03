@@ -1,10 +1,6 @@
 /**
  * Goal Mode Extension — pi adaptation of Codex CLI's /goal feature.
  *
- * Gives the agent a long-running objective it pursues autonomously across
- * multiple turns, until the objective is complete, the token budget runs out,
- * or you pause/clear it.
- *
  * Commands:
  *   /goal               — show current goal status
  *   /goal <objective>   — set a new goal (replaces existing)
@@ -13,14 +9,17 @@
  *   /goal resume        — resume a paused goal
  *
  * Model tools:
- *   create_goal  — the LLM can create a goal on your behalf
- *   get_goal     — the LLM can read goal state
- *   update_goal  — the LLM can only mark the goal "complete" (not pause/resume)
+ *   create_goal  — create a new goal (fails if one exists)
+ *   get_goal     — read current goal state + budget
+ *   update_goal  — mark complete (model cannot pause/resume/budget-limit)
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,21 +31,53 @@ interface GoalState {
   goalId: string;
   objective: string;
   status: GoalStatus;
-  tokenBudget: number | null; // null = unlimited
+  tokenBudget: number | null;
   tokensUsed: number;
   timeUsedSeconds: number;
   createdAt: number;
   updatedAt: number;
 }
 
-interface UsageInfo {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
+// ---------------------------------------------------------------------------
+// Flat-file state — NOT session entries, so goal state is global across
+// pi's tree branches. Otherwise update_goal appends "complete" on one branch
+// while turn_end on another branch still sees "active" from an earlier entry.
+// ---------------------------------------------------------------------------
+
+const STATE_FILE = join(homedir(), ".pi", "goal-state.json");
+
+function loadState(): GoalState | null {
+  try {
+    if (!existsSync(STATE_FILE)) return null;
+    const raw = JSON.parse(readFileSync(STATE_FILE, "utf-8"));
+    if (raw.cleared) return null;
+    if (typeof raw.goalId !== "string" || typeof raw.objective !== "string") return null;
+    return raw as GoalState;
+  } catch {
+    return null;
+  }
+}
+
+function saveState(state: GoalState | null): void {
+  try {
+    if (state) {
+      writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    }
+  } catch {
+    // ignore — extension directory might not exist
+  }
+}
+
+function clearState(): void {
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify({ cleared: true }));
+  } catch {
+    // ignore
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Prompt templates (adapted from Codex's goals/continuation.md)
+// Prompt templates (verbatim from Codex's goals/continuation.md)
 // ---------------------------------------------------------------------------
 
 function continuationPrompt(goal: GoalState): string {
@@ -110,43 +141,9 @@ function budgetLimitPrompt(goal: GoalState): string {
 }
 
 // ---------------------------------------------------------------------------
-// State management — persisted in session entries
-// ---------------------------------------------------------------------------
-
-const GOAL_ENTRY_TYPE = "goal-state";
-
-function goalFromEntry(data: unknown): GoalState | null {
-  if (!data || typeof data !== "object") return null;
-  const d = data as Record<string, unknown>;
-  if (
-    typeof d.goalId !== "string" ||
-    typeof d.objective !== "string" ||
-    typeof d.status !== "string" ||
-    typeof d.tokensUsed !== "number" ||
-    typeof d.timeUsedSeconds !== "number"
-  ) {
-    return null;
-  }
-  return {
-    goalId: d.goalId as string,
-    objective: d.objective as string,
-    status: d.status as GoalStatus,
-    tokenBudget:
-      d.tokenBudget === null || typeof d.tokenBudget === "number"
-        ? (d.tokenBudget as number | null)
-        : null,
-    tokensUsed: d.tokensUsed as number,
-    timeUsedSeconds: d.timeUsedSeconds as number,
-    createdAt: d.createdAt as number,
-    updatedAt: d.updatedAt as number,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Helper to generate unique IDs
+// UUID generator (no external deps)
 // ---------------------------------------------------------------------------
 function newGoalId(): string {
-  // Simple UUID v4-ish generator (no external deps needed)
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0;
     const v = c === "x" ? r : (r & 0x3) | 0x8;
@@ -159,182 +156,99 @@ function newGoalId(): string {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  // ── In-memory state ──────────────────────────────────────────────────
-  let goal: GoalState | null = null;
-  let continuationActive = false; // true while a goal auto-continuation loop is running
-  let budgetLimitReported = false; // avoid repeating budget-limit steering
-  let lastTurnStartTime = 0; // for wall-clock time tracking
-  let goalJustCompleted = false; // suppress next continuation after update_goal(complete)
+  // ── State ────────────────────────────────────────────────────────────
+  let goal: GoalState | null = loadState();
+  let budgetLimitReported = goal?.status === "budget_limited";
+  let lastTurnStartTime = Date.now();
+  let goalJustCompleted = false; // suppress next continuation after complete
 
-  // ── Reconstruct state from session on load ───────────────────────────
-  const reloadGoalFromSession = (ctx: ExtensionContext) => {
-    goal = null;
-    for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type === "custom" && entry.customType === GOAL_ENTRY_TYPE) {
-        const data = entry.data as Record<string, unknown>;
-        if (data.cleared) {
-          goal = null;
-        } else {
-          const parsed = goalFromEntry(entry.data);
-          if (parsed) goal = parsed;
-        }
-      }
-    }
-    return goal;
-  };
-
-  const loadGoal = (ctx: ExtensionContext) => {
-    reloadGoalFromSession(ctx);
-    // Reset runtime-only flags (these are never persisted)
-    continuationActive = false;
-    budgetLimitReported = false;
-    goalJustCompleted = false;
-    lastTurnStartTime = Date.now();
-  };
-
-  pi.on("session_start", async (_event, ctx) => loadGoal(ctx));
-  pi.on("session_tree", async (_event, ctx) => loadGoal(ctx));
-
-  // ── Persist goal state ───────────────────────────────────────────────
-  const saveGoal = () => {
-    if (goal) {
-      pi.appendEntry(GOAL_ENTRY_TYPE, { ...goal });
-    }
-  };
-
-  // ── Token / time accounting ──────────────────────────────────────────
-  const accountUsage = (usage: UsageInfo) => {
+  // ── Token accounting ─────────────────────────────────────────────────
+  pi.on("message_end", async (event) => {
+    if (event.message.role !== "assistant") return;
     if (!goal || goal.status !== "active") return;
-    // Accumulate total tokens (input + output)
-    const tokenDelta = usage.inputTokens + usage.outputTokens;
-    goal.tokensUsed += tokenDelta;
+
+    const u = event.message.usage;
+    if (!u) return;
+    const delta = (u.input ?? u.inputTokens ?? 0) + (u.output ?? u.outputTokens ?? 0);
+    if (delta <= 0) return;
+
+    goal.tokensUsed += delta;
     goal.updatedAt = Date.now();
 
-    // Check budget limit
     if (
       goal.tokenBudget !== null &&
       goal.tokensUsed >= goal.tokenBudget &&
       !budgetLimitReported
     ) {
       goal.status = "budget_limited";
-      goal.updatedAt = Date.now();
       budgetLimitReported = true;
-      saveGoal();
-
-      // Inject budget-limit steering
+      saveState(goal);
       pi.sendMessage(
-        {
-          customType: GOAL_ENTRY_TYPE,
-          content: budgetLimitPrompt(goal),
-          display: false,
-        },
+        { customType: "goal-mode", content: budgetLimitPrompt(goal), display: false },
         { deliverAs: "steer" },
       );
     } else {
-      saveGoal();
+      saveState(goal);
     }
-  };
+  });
 
-  // Track token usage from assistant messages
-  pi.on("message_end", async (event, _ctx) => {
-    if (event.message.role !== "assistant") return;
+  // ── Wall-clock time per turn ─────────────────────────────────────────
+  pi.on("turn_start", () => { lastTurnStartTime = Date.now(); });
+
+  pi.on("turn_end", () => {
+    // Always read fresh from disk — pi may have branched the tree
+    goal = loadState();
+
     if (!goal || goal.status !== "active") return;
 
-    const u = event.message.usage;
-    if (u) {
-      accountUsage({
-        inputTokens: u.input ?? u.inputTokens ?? 0,
-        outputTokens: u.output ?? u.outputTokens ?? 0,
-        totalTokens: u.totalTokens ?? 0,
-      });
-    }
-  });
-
-  // Track wall-clock time per turn
-  pi.on("turn_start", async (_event, _ctx) => {
-    lastTurnStartTime = Date.now();
-  });
-
-  pi.on("turn_end", async (_event, ctx) => {
-    // Re-sync goal state from session — tree navigation can put us on a
-    // branch where the goal is different from what we have in memory.
-    reloadGoalFromSession(ctx);
-
-    if (!goal || goal.status !== "active") {
-      continuationActive = false;
-      return;
-    }
-
-    // Suppress continuation for one turn after update_goal(complete).
-    // Prevents the loop from restarting if a queued continuation message
-    // lands after the goal was marked complete.
     if (goalJustCompleted) {
       goalJustCompleted = false;
-      continuationActive = false;
       return;
     }
 
-    // Account wall-clock time for this turn
     const elapsed = Math.floor((Date.now() - lastTurnStartTime) / 1000);
     if (elapsed > 0) {
       goal.timeUsedSeconds += elapsed;
       goal.updatedAt = Date.now();
-      saveGoal();
+      saveState(goal);
     }
 
     // ── Auto-continuation ──────────────────────────────────────────
-    continuationActive = true;
     pi.sendMessage(
-      {
-        customType: GOAL_ENTRY_TYPE,
-        content: continuationPrompt(goal),
-        display: false,
-      },
+      { customType: "goal-mode", content: continuationPrompt(goal), display: false },
       { deliverAs: "followUp", triggerTurn: true },
     );
   });
 
   // ── Model tools ──────────────────────────────────────────────────────
 
-  // --- get_goal ---
   pi.registerTool({
     name: "get_goal",
     label: "Get Goal",
-    description:
-      "Get the current goal including status, budgets, token/time usage, and remaining budget.",
+    description: "Get the current goal including status, budgets, token/time usage, and remaining budget.",
     parameters: Type.Object({}),
     async execute() {
+      goal = loadState();
       if (!goal) {
-        return {
-          content: [{ type: "text", text: "No goal is currently set." }],
-          details: { goal: null },
-        };
+        return { content: [{ type: "text", text: "No goal is currently set." }], details: { goal: null } };
       }
-      const remaining =
-        goal.tokenBudget !== null
-          ? Math.max(0, goal.tokenBudget - goal.tokensUsed)
-          : null;
+      const remaining = goal.tokenBudget !== null ? Math.max(0, goal.tokenBudget - goal.tokensUsed) : null;
       return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `Goal: ${goal.objective}`,
-              `Status: ${goal.status}`,
-              `Tokens used: ${goal.tokensUsed}${goal.tokenBudget !== null ? ` / ${goal.tokenBudget}` : ""}`,
-              remaining !== null ? `Tokens remaining: ${remaining}` : null,
-              `Time used: ${goal.timeUsedSeconds}s`,
-            ]
-              .filter(Boolean)
-              .join("\n"),
-          },
-        ],
+        content: [{
+          type: "text",
+          text: [
+            `Goal: ${goal.objective}`,
+            `Status: ${goal.status}`,
+            `Tokens used: ${goal.tokensUsed}${goal.tokenBudget !== null ? ` / ${goal.tokenBudget}` : ""}`,
+            remaining !== null ? `Tokens remaining: ${remaining}` : null,
+            `Time used: ${goal.timeUsedSeconds}s`,
+          ].filter(Boolean).join("\n"),
+        }],
         details: { goal: { ...goal }, remainingTokens: remaining },
       };
     },
   });
 
-  // --- create_goal ---
   pi.registerTool({
     name: "create_goal",
     label: "Create Goal",
@@ -344,128 +258,73 @@ export default function (pi: ExtensionAPI) {
       "Set token_budget only when an explicit token budget is requested. " +
       "Fails if a goal already exists; use update_goal only for status changes.",
     parameters: Type.Object({
-      objective: Type.String({
-        description: "The concrete objective to pursue.",
-      }),
-      token_budget: Type.Optional(
-        Type.Number({
-          description: "Optional positive token budget.",
-        }),
-      ),
+      objective: Type.String({ description: "The concrete objective to pursue." }),
+      token_budget: Type.Optional(Type.Number({ description: "Optional positive token budget." })),
     }),
     async execute(_toolCallId, params) {
+      goal = loadState();
       if (goal) {
         return {
-          content: [
-            {
-              type: "text",
-              text: "Cannot create a new goal because one already exists. " +
-                "Use get_goal to see it, or update_goal to mark it complete.",
-            },
-          ],
+          content: [{ type: "text", text: "Cannot create a new goal because one already exists. Use get_goal to see it, or update_goal to mark it complete." }],
           details: { error: "goal already exists" },
         };
       }
-      if (!params.objective || params.objective.trim().length === 0) {
-        return {
-          content: [
-            { type: "text", text: "Goal objective must not be empty." },
-          ],
-          details: { error: "empty objective" },
-        };
+      if (!params.objective?.trim()) {
+        return { content: [{ type: "text", text: "Goal objective must not be empty." }], details: { error: "empty objective" } };
       }
       const now = Date.now();
+      const tokenBudget = (params.token_budget != null && params.token_budget > 0) ? params.token_budget : null;
       goal = {
         goalId: newGoalId(),
         objective: params.objective.trim(),
-        status: (params.token_budget !== undefined &&
-          params.token_budget !== null &&
-          params.token_budget <= 0)
-          ? "budget_limited"
-          : "active",
-        tokenBudget:
-          params.token_budget !== undefined && params.token_budget !== null && params.token_budget > 0
-            ? params.token_budget
-            : null,
+        status: (tokenBudget !== null && tokenBudget <= 0) ? "budget_limited" : "active",
+        tokenBudget,
         tokensUsed: 0,
         timeUsedSeconds: 0,
         createdAt: now,
         updatedAt: now,
       };
       budgetLimitReported = goal.status === "budget_limited";
-      continuationActive = false;
-      saveGoal();
-
+      goalJustCompleted = false;
+      saveState(goal);
       return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `Goal created: ${goal.objective}`,
-              `Status: ${goal.status}`,
-              goal.tokenBudget !== null
-                ? `Token budget: ${goal.tokenBudget}`
-                : null,
-            ]
-              .filter(Boolean)
-              .join("\n"),
-          },
-        ],
+        content: [{
+          type: "text",
+          text: [`Goal created: ${goal.objective}`, `Status: ${goal.status}`, goal.tokenBudget !== null ? `Token budget: ${goal.tokenBudget}` : null].filter(Boolean).join("\n"),
+        }],
         details: { goal: { ...goal } },
       };
     },
   });
 
-  // --- update_goal ---
   pi.registerTool({
     name: "update_goal",
     label: "Update Goal",
     description:
       "Update the existing goal. " +
       "Use this tool ONLY to mark the goal achieved (status='complete'). " +
-      "Set status to 'complete' only when the objective has ACTUALLY been achieved " +
-      "and no required work remains. " +
+      "Set status to 'complete' only when the objective has ACTUALLY been achieved and no required work remains. " +
       "Do NOT mark a goal complete merely because budget is nearly exhausted. " +
-      "You CANNOT use this tool to pause, resume, or budget-limit; " +
-      "those are controlled by the user or system.",
-    parameters: Type.Object({
-      status: StringEnum(["complete"] as const),
-    }),
+      "You CANNOT use this tool to pause, resume, or budget-limit; those are controlled by the user or system.",
+    parameters: Type.Object({ status: StringEnum(["complete"] as const) }),
     async execute() {
+      goal = loadState();
       if (!goal) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "No goal exists to update.",
-            },
-          ],
-          details: { error: "no goal" },
-        };
+        return { content: [{ type: "text", text: "No goal exists to update." }], details: { error: "no goal" } };
       }
-      const wasActive = goal.status === "active";
       goal.status = "complete";
       goal.updatedAt = Date.now();
-      continuationActive = false;
       goalJustCompleted = true;
-      saveGoal();
+      saveState(goal);
 
       let report = "Goal marked complete.";
       if (goal.tokenBudget !== null || goal.timeUsedSeconds > 0) {
         const parts: string[] = [];
-        if (goal.tokenBudget !== null) {
-          parts.push(`tokens used: ${goal.tokensUsed} of ${goal.tokenBudget}`);
-        }
-        if (goal.timeUsedSeconds > 0) {
-          parts.push(`time used: ${goal.timeUsedSeconds} seconds`);
-        }
+        if (goal.tokenBudget !== null) parts.push(`tokens used: ${goal.tokensUsed} of ${goal.tokenBudget}`);
+        if (goal.timeUsedSeconds > 0) parts.push(`time used: ${goal.timeUsedSeconds} seconds`);
         report += ` Report to user: ${parts.join("; ")}.`;
       }
-
-      return {
-        content: [{ type: "text", text: report }],
-        details: { goal: { ...goal }, wasActive },
-      };
+      return { content: [{ type: "text", text: report }], details: { goal: { ...goal } } };
     },
   });
 
@@ -477,26 +336,14 @@ export default function (pi: ExtensionAPI) {
       const trimmed = args?.trim() ?? "";
 
       if (!trimmed) {
-        // /goal — show status
+        goal = loadState();
         if (!goal) {
-          ctx.ui.notify(
-            "No goal is currently set.",
-            "info",
-          );
-          ctx.ui.notify(
-            "Usage: /goal <objective>  — set a goal",
-            "info",
-          );
-          ctx.ui.notify(
-            "       /goal clear | pause | resume",
-            "info",
-          );
+          ctx.ui.notify("No goal is currently set.", "info");
+          ctx.ui.notify("Usage: /goal <objective>  — set a goal", "info");
+          ctx.ui.notify("       /goal clear | pause | resume", "info");
           return;
         }
-        const remaining =
-          goal.tokenBudget !== null
-            ? Math.max(0, goal.tokenBudget - goal.tokensUsed)
-            : null;
+        const remaining = goal.tokenBudget !== null ? Math.max(0, goal.tokenBudget - goal.tokensUsed) : null;
         const lines = [
           `Goal: ${goal.objective}`,
           `Status: ${goal.status}`,
@@ -508,118 +355,64 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Subcommands
       const lower = trimmed.toLowerCase();
       switch (lower) {
-        case "clear": {
-          if (!goal) {
-            ctx.ui.notify("No goal to clear.", "warning");
-            return;
-          }
-          const obj = goal.objective;
+        case "clear":
           goal = null;
-          continuationActive = false;
+          goalJustCompleted = false;
           budgetLimitReported = false;
-          // Append a sentinel so session_start knows goal was cleared
-          pi.appendEntry(GOAL_ENTRY_TYPE, { cleared: true, at: Date.now() });
-          ctx.ui.notify(`Goal cleared: "${obj}"`, "info");
+          clearState();
+          ctx.ui.notify("Goal cleared.", "info");
           return;
-        }
 
-        case "pause": {
-          if (!goal) {
-            ctx.ui.notify("No goal to pause.", "warning");
-            return;
-          }
-          if (goal.status !== "active") {
-            ctx.ui.notify(
-              `Goal is ${goal.status}, not active.`,
-              "warning",
-            );
-            return;
-          }
+        case "pause":
+          goal = loadState();
+          if (!goal) { ctx.ui.notify("No goal to pause.", "warning"); return; }
+          if (goal.status !== "active") { ctx.ui.notify(`Goal is ${goal.status}, not active.`, "warning"); return; }
           goal.status = "paused";
           goal.updatedAt = Date.now();
-          continuationActive = false;
-          saveGoal();
+          saveState(goal);
           ctx.ui.notify(`Goal paused: "${goal.objective}"`, "info");
           return;
-        }
 
-        case "resume": {
-          if (!goal) {
-            ctx.ui.notify("No goal to resume.", "warning");
-            return;
-          }
-          if (goal.status !== "paused") {
-            ctx.ui.notify(
-              `Goal is ${goal.status}, not paused.`,
-              "warning",
-            );
-            return;
-          }
+        case "resume":
+          goal = loadState();
+          if (!goal) { ctx.ui.notify("No goal to resume.", "warning"); return; }
+          if (goal.status !== "paused") { ctx.ui.notify(`Goal is ${goal.status}, not paused.`, "warning"); return; }
           goal.status = "active";
           goal.updatedAt = Date.now();
           budgetLimitReported = false;
-          continuationActive = false;
+          goalJustCompleted = false;
           lastTurnStartTime = Date.now();
-          saveGoal();
+          saveState(goal);
           ctx.ui.notify(`Goal resumed: "${goal.objective}"`, "info");
-
-          // Kick off continuation immediately
           pi.sendMessage(
-            {
-              customType: GOAL_ENTRY_TYPE,
-              content: continuationPrompt(goal!),
-              display: false,
-            },
+            { customType: "goal-mode", content: continuationPrompt(goal!), display: false },
             { deliverAs: "followUp", triggerTurn: true },
           );
           return;
-        }
 
         default: {
-          // /goal <objective> — set a new goal
-          const objective = trimmed;
           const now = Date.now();
-
-          if (goal) {
-            // Confirm replacement via notify (simple approach)
-            const oldObj = goal.objective;
-            goal = {
-              goalId: newGoalId(),
-              objective,
-              status: "active",
-              tokenBudget: goal.tokenBudget, // preserve budget from old goal?
-              tokensUsed: 0,
-              timeUsedSeconds: 0,
-              createdAt: now,
-              updatedAt: now,
-            };
-            budgetLimitReported = false;
-            continuationActive = false;
-            lastTurnStartTime = now;
-            saveGoal();
-            ctx.ui.notify(
-              `Goal replaced: "${oldObj}" → "${objective}"`,
-              "info",
-            );
+          const oldGoal = loadState();
+          goal = {
+            goalId: newGoalId(),
+            objective: trimmed,
+            status: "active",
+            tokenBudget: null,
+            tokensUsed: 0,
+            timeUsedSeconds: 0,
+            createdAt: now,
+            updatedAt: now,
+          };
+          budgetLimitReported = false;
+          goalJustCompleted = false;
+          lastTurnStartTime = now;
+          saveState(goal);
+          if (oldGoal) {
+            ctx.ui.notify(`Goal replaced: "${oldGoal.objective}" → "${trimmed}"`, "info");
           } else {
-            goal = {
-              goalId: newGoalId(),
-              objective,
-              status: "active",
-              tokenBudget: null,
-              tokensUsed: 0,
-              timeUsedSeconds: 0,
-              createdAt: now,
-              updatedAt: now,
-            };
-            budgetLimitReported = false;
-            continuationActive = false;
-            lastTurnStartTime = now;
-            saveGoal();
-            ctx.ui.notify(`Goal set: "${objective}"`, "info");
+            ctx.ui.notify(`Goal set: "${trimmed}"`, "info");
           }
         }
       }
