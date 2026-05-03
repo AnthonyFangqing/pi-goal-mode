@@ -164,11 +164,11 @@ export default function (pi: ExtensionAPI) {
   let continuationActive = false; // true while a goal auto-continuation loop is running
   let budgetLimitReported = false; // avoid repeating budget-limit steering
   let lastTurnStartTime = 0; // for wall-clock time tracking
+  let goalJustCompleted = false; // suppress next continuation after update_goal(complete)
 
   // ── Reconstruct state from session on load ───────────────────────────
-  const loadGoal = (ctx: ExtensionContext) => {
+  const reloadGoalFromSession = (ctx: ExtensionContext) => {
     goal = null;
-    // Walk the branch — last goal-state or cleared-sentinel wins
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type === "custom" && entry.customType === GOAL_ENTRY_TYPE) {
         const data = entry.data as Record<string, unknown>;
@@ -180,9 +180,15 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }
+    return goal;
+  };
+
+  const loadGoal = (ctx: ExtensionContext) => {
+    reloadGoalFromSession(ctx);
     // Reset runtime-only flags (these are never persisted)
     continuationActive = false;
     budgetLimitReported = false;
+    goalJustCompleted = false;
     lastTurnStartTime = Date.now();
   };
 
@@ -237,8 +243,8 @@ export default function (pi: ExtensionAPI) {
     const u = event.message.usage;
     if (u) {
       accountUsage({
-        inputTokens: u.inputTokens ?? 0,
-        outputTokens: u.outputTokens ?? 0,
+        inputTokens: u.input ?? u.inputTokens ?? 0,
+        outputTokens: u.output ?? u.outputTokens ?? 0,
         totalTokens: u.totalTokens ?? 0,
       });
     }
@@ -249,8 +255,24 @@ export default function (pi: ExtensionAPI) {
     lastTurnStartTime = Date.now();
   });
 
-  pi.on("turn_end", async (_event, _ctx) => {
-    if (!goal || goal.status !== "active") return;
+  pi.on("turn_end", async (_event, ctx) => {
+    // Re-sync goal state from session — tree navigation can put us on a
+    // branch where the goal is different from what we have in memory.
+    reloadGoalFromSession(ctx);
+
+    if (!goal || goal.status !== "active") {
+      continuationActive = false;
+      return;
+    }
+
+    // Suppress continuation for one turn after update_goal(complete).
+    // Prevents the loop from restarting if a queued continuation message
+    // lands after the goal was marked complete.
+    if (goalJustCompleted) {
+      goalJustCompleted = false;
+      continuationActive = false;
+      return;
+    }
 
     // Account wall-clock time for this turn
     const elapsed = Math.floor((Date.now() - lastTurnStartTime) / 1000);
@@ -261,23 +283,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     // ── Auto-continuation ──────────────────────────────────────────
-    // After every turn where the goal is still active, inject a hidden
-    // continuation prompt so the agent keeps working without user input.
-    // The loop stops when the model calls update_goal(complete), the
-    // budget runs out, or the user pauses/clears the goal.
-    if (goal.status === "active") {
-      continuationActive = true;
-      pi.sendMessage(
-        {
-          customType: GOAL_ENTRY_TYPE,
-          content: continuationPrompt(goal),
-          display: false,
-        },
-        { deliverAs: "followUp", triggerTurn: true },
-      );
-    } else {
-      continuationActive = false;
-    }
+    continuationActive = true;
+    pi.sendMessage(
+      {
+        customType: GOAL_ENTRY_TYPE,
+        content: continuationPrompt(goal),
+        display: false,
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
   });
 
   // ── Model tools ──────────────────────────────────────────────────────
@@ -433,6 +447,7 @@ export default function (pi: ExtensionAPI) {
       goal.status = "complete";
       goal.updatedAt = Date.now();
       continuationActive = false;
+      goalJustCompleted = true;
       saveGoal();
 
       let report = "Goal marked complete.";
